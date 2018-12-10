@@ -1,0 +1,681 @@
+#!/usr/bin/python3
+"""
+    This file demonstrates how to setup a 'Linux' bluetooth device for simple PIN based pairing.  This code
+    has been tested on the following platforms and versions:
+
+    Platform           Linux                Bluetooth/BlueZ Ver            Paired With   
+    -------------------------------------------------------------------------------------
+    AMD64 Desktop      Ubuntu 18.04         5.48-0ubuntu3.1                 Android
+    NanoPiNeoAir       Ubuntu 16.04         5.37-0ubuntu5.1                 Android
+
+    This file implements the bluez 'org.bluez.Agent1' interface utilizing the Python DBUS extensions
+    and publishes that interface onto the DBUS and registers the agent as the default bluetooth
+    agent.  The 'org.bluez.Agent1' interface in this file is setup to utilize legacy PIN based
+    authentication.  There are a couple of important factors that must work correctly in order for
+    the PIN based pairing to work.
+
+    1. The following command at line 506 must succeed so legacy pairing will be turned on. Otherwise, the
+       RequestPinCode method will never be called on the agent.
+
+        hciconfig hci0 sspmode 0
+
+    2. After the pin code is returned from RequestPinCode, it will be verified, if the veriefication
+       succeeds then a call is recieved on the 'AuthorizeService' method in which case we mark the
+       device as trusted.  If pin code entered on the remote device is not a match, we should not
+       recieve a call to 'AuthorizeService'
+
+    NOTE: This agent service only handles the PIN code verification and authorization for the device.
+
+"""
+
+import argparse
+
+import atexit
+import ctypes
+import ctypes.util
+import json
+import logging
+import os
+import resource
+import signal
+import socket
+import subprocess
+import sys
+import time
+import traceback
+import uuid
+
+import dbus
+import dbus.service
+import dbus.mainloop.glib
+
+try:
+  import pwd
+except ImportError:
+  import getpass
+  pwd = None
+
+def current_user():
+  if pwd:
+    return pwd.getpwuid(os.geteuid()).pw_name
+  else:
+    return getpass.getuser()
+
+USER = current_user()
+
+try:
+  from gi.repository import GObject
+except ImportError:
+  import gobject as GObject
+
+DEBUG_MODE = False
+SINGLE_MODE = False
+
+BLUEZ_BUS_NAME = "org.bluez"
+BLUEZ_BUS_PATH = "/org/bluez"
+
+BLUEZ_INTERFACE_AGENTMANAGER1 = "org.bluez.AgentManager1"
+BLUEZ_INTERFACE_AGENT1 = "org.bluez.Agent1"
+BLUEZ_INTERFACE_DEVICE1 = "org.bluez.Device1"
+
+DBUS_INTERFACE_PROPERTIES = "org.freedesktop.DBus.Properties"
+
+SERIAL_AGENT_PATH = "/serial/bluetooth/agent"
+SERIAL_PROFILE_PATH = "/serial/bluetooth/profile"
+
+AGENT_PAIRING_CAPABILITIES = "NoInputNoOutput" 
+AGENT_PIN_CODE = "123456"
+
+AGENT_DIR = os.path.abspath(os.path.dirname(__file__))
+
+LOG_DIR = "/var/log"
+if USER is not 'root':
+    LOG_DIR = os.path.join(os.path.expanduser("~"), "logs")
+    if not os.path.exists(LOG_DIR):
+        os.makedirs(LOG_DIR)
+
+AGENT_SERVICE_LOGFILE = os.path.join(LOG_DIR, "simple_bluetooth_agent_d.log")
+
+AGENT_PID_FILE = "/var/run/bluetooth_pin_agent.pid"
+
+AGENT_SERVICE_LOGGER =  "bluetooth_pin_agent"
+
+# Service Globals
+device_obj = None
+dev_path = None
+mainloop = None
+
+service_logger = None
+svclog_stream = None
+
+def ask(prompt):
+    try:
+        return raw_input(prompt)
+    except:
+        return input(prompt)
+
+def log_message(message):
+    global service_logger
+    # print("%s: %s" % (AGENT_SERVICE_LOGGER, message))
+    if not service_logger is None:
+        service_logger.log(50, message)
+        svclog_stream.flush()
+    return
+
+def open_logger(clean_file=False):
+    global service_logger
+    global svclog_stream
+
+    mode = 'a'
+    if clean_file:
+        mode = 'w'
+    logf = open(AGENT_SERVICE_LOGFILE, mode)
+    svclog_stream = logging.StreamHandler(logf)
+    service_logger = logging.getLogger(AGENT_SERVICE_LOGGER)
+    service_logger.addHandler(svclog_stream)
+    service_logger.log(50, "Successfully opened the %r logger." % AGENT_SERVICE_LOGGER)
+    return
+
+def run_command(command_line):
+    sproc = subprocess.Popen(command_line,
+            stdout = subprocess.PIPE,
+            stderr = subprocess.PIPE,
+            bufsize = -1, shell = True)
+    stdout, stderr = sproc.communicate()
+    rtncode = sproc.returncode
+
+    return rtncode, stdout, stderr
+
+def run_command_detached(command_line):
+    sproc = subprocess.Popen(command_line, shell=False, stdin=None, stdout=None, stderr=None, close_fds=True)
+    return
+
+def set_trusted(path):
+    bus = dbus.SystemBus()
+    props = dbus.Interface(bus.get_object(BLUEZ_BUS_NAME, path), DBUS_INTERFACE_PROPERTIES)
+    props.Set(BLUEZ_INTERFACE_DEVICE1, "Trusted", True)
+    return
+
+class Canceled(dbus.DBusException):
+    _dbus_error_name = "org.bluez.Error.Canceled"
+
+class Rejected(dbus.DBusException):
+    _dbus_error_name = "org.bluez.Error.Rejected"
+
+class GoodbyeError(Exception):
+    def __init__(self, message, *args):
+        Exception.__init__(self, message, *args)
+        return
+
+class BluetoothPinAgent(dbus.service.Object):
+    """
+        The 'BluetoothPinAgent' object implements the 'org.bluez.Agent1' interface
+        to allow for device pairing.
+    """
+
+    CANCEL_PIN_ONLY_MESSAGE = "This device utilizes ssp_mode 0 PIN pairing only."
+
+    def set_exit_on_release(self, exit_on_release):
+        self.exit_on_release = exit_on_release
+
+    @dbus.service.method(BLUEZ_INTERFACE_AGENT1, in_signature="", out_signature="")
+    def Release(self):
+        """
+            This method gets called when the service daemon unregisters the agent. An
+            agent can use it to do cleanup tasks. There is no need to unregister the
+            agent, because when this method gets called it has already been unregistered.
+        """
+        log_message("BluetoothPinAgent - Release called")
+        return
+
+    @dbus.service.method(BLUEZ_INTERFACE_AGENT1, in_signature="os", out_signature="")
+    def AuthorizeService(self, device, uuid):
+        """
+            This method gets called when the service daemon needs to authorize a
+            connection/service request.
+
+            Possible errors: org.bluez.Error.Rejected
+                             org.bluez.Error.Canceled
+        """
+        log_message("AuthorizeService (%s, %s)" % (device, uuid))
+        set_trusted(device)
+        if SINGLE_MODE:
+            mainloop.quit()
+        return
+
+    @dbus.service.method(BLUEZ_INTERFACE_AGENT1, in_signature="o", out_signature="s")
+    def RequestPinCode(self, device):
+        """
+            This method gets called when the service daemon needs to get the pin code for
+            an authentication.
+
+            The return value should be a string of 1-16 characters length. The string can
+            be alphanumeric.
+
+            Possible errors: org.bluez.Error.Rejected
+                             org.bluez.Error.Canceled
+        """
+        log_message("RequestPinCode (%s)" % (device))
+        #try:
+        #    set_trusted(device)
+        #except:
+        #    err_msg = traceback.format_exc()
+        #    log_message(err_msg)
+        return AGENT_PIN_CODE
+
+    @dbus.service.method(BLUEZ_INTERFACE_AGENT1, in_signature="o", out_signature="u")
+    def RequestPasskey(self, device):
+        """
+            This method gets called when the service daemon needs to get the passkey for
+            an authentication.
+
+            The return value should be a numeric value between 0-999999.
+
+            Possible errors: org.bluez.Error.Rejected
+                             org.bluez.Error.Canceled
+        """
+        log_message("RequestPasskey (%s)" % (device))
+        raise Canceled("This device utilizes ssp_mode 0 PIN pairing only.")
+        return
+
+    @dbus.service.method(BLUEZ_INTERFACE_AGENT1, in_signature="ouq", out_signature="")
+    def DisplayPasskey(self, device, passkey, entered):
+        """
+            This method gets called when the service daemon needs to display a passkey
+            for an authentication.
+
+            The entered parameter indicates the number of already typed keys on the remote
+            side.
+
+            An empty reply should be returned. When the passkey needs no longer to be
+            displayed, the Cancel method of the agent will be called.
+
+            During the pairing process this method might be called multiple times to
+            update the entered value.
+
+        """
+        log_message("DisplayPasskey (%s, %06u entered %u)" % (device, passkey, entered))
+        return
+
+    @dbus.service.method(BLUEZ_INTERFACE_AGENT1, in_signature="os", out_signature="")
+    def DisplayPinCode(self, device, pincode):
+        """
+            This method gets called when the service daemon needs to display a pincode
+            for an authentication.
+
+            An empty reply should be returned. When the pincode needs no longer to be
+            displayed, the Cancel method of the agent will be called.
+
+            This is used during the pairing process of keyboards that don't support
+            Bluetooth 2.1 Secure Simple Pairing, in contrast to DisplayPasskey which is
+            used for those that do.
+
+            This method will only ever be called once since older keyboards do not
+            support typing notification.
+
+            Note that the PIN will always be a 6-digit number, zero-padded to 6 digits.
+            This is for harmony with the later specification.
+
+            Possible errors: org.bluez.Error.Rejected
+                             org.bluez.Error.Canceled
+        """
+        log_message("DisplayPinCode (%s, %s)" % (device, pincode))
+        return
+
+    @dbus.service.method(BLUEZ_INTERFACE_AGENT1, in_signature="ou", out_signature="")
+    def RequestConfirmation(self, device, passkey):
+        """
+            This method gets called when the service daemon needs to confirm a passkey
+            for an authentication.
+
+            To confirm the value it should return an empty reply or an error in case the
+            passkey is invalid.
+
+            Note that the passkey will always be a 6-digit number, so the display should
+            be zero-padded at the start if the value contains less than 6 digits.
+
+            Possible errors: org.bluez.Error.Rejected
+                             org.bluez.Error.Canceled
+        """
+        log_message("RequestConfirmation (%s, %06d)" % (device, passkey))
+        raise Canceled("This device utilizes ssp_mode 0 PIN pairing only.")
+        return
+
+    @dbus.service.method(BLUEZ_INTERFACE_AGENT1, in_signature="o", out_signature="")
+    def RequestAuthorization(self, device):
+        """
+            This method gets called to request the user to authorize an incoming pairing
+            attempt which would in other circumstances trigger the just-works model.
+
+            Possible errors: org.bluez.Error.Rejected
+                             org.bluez.Error.Canceled
+
+        """
+        log_message("RequestAuthorization (%s)" % (device))
+        #auth = ask("Authorize? (yes/no): ")
+        #if (auth == "yes"):
+        #    return
+        #raise Rejected("Pairing rejected")
+        return
+
+    @dbus.service.method(BLUEZ_INTERFACE_AGENT1, in_signature="", out_signature="")
+    def Cancel(self):
+        """
+            This method gets called to indicate that the agent request failed before a
+            reply was returned.
+        """
+        log_message("BluetoothPinAgent - Cancel called")
+        return
+
+class BluetoothService(object):
+
+    #Default maximum for the number of available file descriptors
+    DEFAULT_MAXFD = 1024
+
+    #Default file mode creation mask for the daemon
+    DEFAULT_UMASK = 0
+
+    #Default working directory for the daemon
+    DEFAULT_ROOTDIR = "/"
+
+    #Default device null
+    DEFAULT_DEVNULL = "/dev/null"
+
+    SERVICE_PID_FILE = AGENT_PID_FILE
+
+    PROFILE_UUID = "1101"
+    PROFILE_ARGS = {
+        "AutoConnect": False,
+        "Name": "SerialServce",
+        "Role": "server",
+        "PSM": dbus.UInt16("3"),
+        "Service": "bluetooth/serial"
+    }
+
+    def __init__(self):
+        """
+            This is a generic daemon class intended to make it easy to create a daemon.  A daemon has the following configurable
+            behaviors:
+
+                1. Resets the current working directory to '/'
+                2. Resets the current file creation mode mask to 0
+                3. Closes all open files (1024)
+                4. Detaches from the starting terminal and redirects standard I/O streams to '/dev/null'
+
+            References:
+                1. Advanced Programming in the Unix Environment: W. Richard Stevens
+            """
+        self._pid_file = self.SERVICE_PID_FILE
+
+        self._profile_uuid = self.PROFILE_UUID
+        self._profile_args = self.PROFILE_ARGS
+        self._daemon_logfile = None
+
+        return
+
+    def daemonize(self):
+        """
+            This method detaches the current process from the controlling terminal and forks
+            it to a process that is a background daemon process.
+        """
+        self._daemon_logfile = "/tmp/simple_bluetooth_agent_d.log"
+        if os.path.exists(self._daemon_logfile):
+            os.remove(self._daemon_logfile)
+
+        proc_id = None
+        try:
+            # Fork the 'FIRST' child process and let the parent process where (pid > 0) exit cleanly and return
+            # to the terminal
+            proc_id = os.fork()
+        except OSError as os_err:
+            err_msg = "%s\n    errno=%d\n" % (os_err.strerror, os_err.errno)
+            log_message(err_msg)
+            raise Exception (err_msg)
+
+        # Fork returns 0 in the child and a process id in the parent.  If we are running in the parent
+        # process then exit cleanly with no error.
+        if proc_id > 0:
+            sys.exit(0)
+
+        # Call os.setsid() to:
+        #    1. Become the session leader of this new session
+        #    2. Become the process group leader of this new process group
+        #    3. This also guarantees that this process will not have controlling terminal
+        os.setsid()
+
+        proc_id = None
+        try:
+            # For the 'SECOND' child process and let the parent process where (proc_id > 0) exit cleanly
+            # This second process fork has the following effects:
+            #     1. Since the first child is a session leader without controlling terminal, it is possible
+            #        for it to acquire one be opening one in the future.  This second fork guarantees that
+            #        the child is no longer a session leader, preventing the daemon from ever acquiring a
+            #        controlling terminal.
+            proc_id = os.fork()
+        except OSError as os_err:
+            err_msg = "%s\n    errno=%d\n" % (os_err.strerror, os_err.errno)
+            log_message(err_msg)
+            raise Exception (err_msg)
+
+        # Fork returns 0 in the child and a process id in the parent.  If we are running in the parent
+        # process then exit cleanly with no error.
+        if proc_id > 0:
+            sys.exit(0)
+
+        log_message("Second fork successful.")
+
+        # We want to change the working directory of the daemon to '/' to avoid the issue of not being
+        # able to unmount the file system at shutdown time.
+        os.chdir(self.DEFAULT_ROOTDIR)
+
+        # We don't want to inherit the file mode creation flags from the parent process.  We
+        # give the child process complete control over the permissions
+        os.umask(self.DEFAULT_UMASK)
+
+        maxfd = resource.getrlimit(resource.RLIMIT_NOFILE)[1]
+        if (maxfd == resource.RLIM_INFINITY):
+            maxfd = self.DEFAULT_MAXFD
+
+        stdin_fileno = sys.stdin.fileno()
+        stdout_fileno = sys.stdout.fileno()
+        stderr_fileno = sys.stderr.fileno()
+
+        # Go through all the file descriptors that could have possibly been open and close them
+        # This includes the existing stdin, stdout and stderr
+        sys.stdout.flush()
+        sys.stderr.flush()
+
+        # Close all 1024 possible open FDs
+        for fd in xrange(maxfd):
+            try:
+                os.close(fd)
+            except OSError as os_err:
+                pass
+            except:
+                err_trace = traceback.format_exc()
+
+        # Create the standard file descriptors and redirect them to the standard file descriptor
+        # numbers 0 stdin, 1 stdout, 2 stderr
+        stdin_f = file(self.DEFAULT_DEVNULL , 'r')
+        stdout_f = file(self.DEFAULT_DEVNULL, 'a+')
+        stderr_f = file(self.DEFAULT_DEVNULL, 'a+')
+
+        os.dup2(stdin_f.fileno(), stdin_fileno)
+        os.dup2(stdout_f.fileno(), stdout_fileno)
+        os.dup2(stderr_f.fileno(), stderr_fileno)
+
+        # Register an the removal of the PID file on python interpreter exit
+        atexit.register(self._remove_pidfile)
+
+        # Create the pid file to prevent multiple launches of the daemon
+        pid_str = str(os.getpid())
+        with open(self._pid_file, 'w') as pid_f:
+            pid_f.write("%s\n" % pid_str)
+
+        return
+
+    def process_exists(self, process_id):
+        """
+            Checks to see if a process exists
+        """
+        result = None
+        try:
+            os.kill(process_id, 0)
+            result = True
+        except OSError:
+            result = False
+        return result
+
+    def restart(self):
+        """
+            Restart the Bluetooth Pin Pairing Agent Service
+        """
+        self.stop()
+        self.start()
+        return
+
+    def run(self):
+        """
+            This is the main 'Bluetooth Pin Pairing Agent Service' entry method that will setup the DBUS interfaces
+            to handle the Bluetooth integration for the service.
+        """
+        global mainloop
+
+        nxt_cmd = "/usr/sbin/rfkill unblock bluetooth"
+        rtncode, stdout, stderr = run_command(nxt_cmd);
+        if rtncode != 0:
+            log_message("'%s' command failed. rtncode=%d" % (nxt_cmd, rtncode))
+        time.sleep(1)
+
+        nxt_cmd = "hciconfig hci0 up"
+        rtncode, stdout, stderr = run_command(nxt_cmd);
+        if rtncode != 0:
+            log_message("'%s' command failed. rtncode=%d" % (nxt_cmd, rtncode))
+        time.sleep(3)
+
+        nxt_cmd = "hciconfig hci0 piscan"
+        rtncode, stdout, stderr = run_command(nxt_cmd)
+        if rtncode != 0:
+            log_message("'%s' command failed. rtncode=%d" % (nxt_cmd, rtncode))
+        time.sleep(2)
+
+        nxt_cmd = "hciconfig hci0 sspmode 0"
+        rtncode, stdout, stderr = run_command(nxt_cmd)
+        if rtncode != 0:
+            log_message("'%s' command failed. rtncode=%d" % (nxt_cmd, rtncode))
+
+        log_message("Started 'BluetoothSerialService' application and detached.")
+
+        dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
+
+        bus = dbus.SystemBus()
+
+        if bus != None:
+            agent = BluetoothPinAgent(bus, SERIAL_AGENT_PATH)
+            
+            bluez_obj = bus.get_object(BLUEZ_BUS_NAME, BLUEZ_BUS_PATH)
+
+            if bluez_obj != None:
+                mainloop = GObject.MainLoop()
+
+                try:
+                    agent_manager = dbus.Interface(bluez_obj, BLUEZ_INTERFACE_AGENTMANAGER1)
+
+                    resp = agent_manager.RegisterAgent(SERIAL_AGENT_PATH, AGENT_PAIRING_CAPABILITIES)
+                    log_message("Pairing agent registered. resp=%r" % resp)
+
+                    resp = agent_manager.RequestDefaultAgent(SERIAL_AGENT_PATH)
+                    log_message("Pairing agent set as default. resp=%r" % resp)
+
+                    # This is where our thread enters our GObject dispatching loop
+                    log_message("Starting 'Bluetooth Pin Pairing Agent Service' DBUS main loop.")
+                    mainloop.run()
+
+                    log_message("Main loop exited normally.")
+
+                except:
+                    err_msg = traceback.format_exc()
+                    log_message(err_msg)
+
+                finally:
+                    agent_manager.UnregisterAgent(SERIAL_AGENT_PATH)
+                    log_message("Pairing agent unregistered.")
+
+            else:
+                log_message("Unable to open the BlueZ bus.")
+
+        else:
+            log_message("Unable to open DBUS system bus.")
+
+        return
+
+    def start(self):
+        """
+            Start the Bluetooth Pin Pairing Agent Service
+        """
+
+        #Check to see if the pid file exists to see if the daemon is already running
+        proc_id = None
+        try:
+            with open(self._pid_file, 'r') as pid_f:
+                proc_id_str = pid_f.read().strip()
+                proc_id = int(proc_id_str)
+
+            # If we found a PID file but the process in the PID file does not exists,
+            # then we are most likely reading a stale PID file.  Go ahead and startup
+            # a new instance of the daemon
+            if not self.process_exists(proc_id):
+                os.remove(self._pid_file)
+                proc_id = None
+
+        except IOError:
+            proc_id = None
+
+        if proc_id != None:
+            log_message("The 'Bluetooth Pin Pairing Agent Service' was already running.")
+            sys.exit(1)
+
+        if not DEBUG_MODE and not SINGLE_MODE:
+            # Start the daemon
+            log_message("The 'Bluetooth Pin Pairing Agent Service' is about to become a daemon.")
+            self.daemonize()
+        else:
+            log_message("The 'Bluetooth Pin Pairing Agent Service' skipping daemonization.")
+ 
+        # Now that we are a daemon we need to switch over to using the logger
+        open_logger()
+
+        log_message("The 'Bluetooth Pin Pairing Agent Service' is now a daemon, lets run with it.")
+        self.run()
+
+        return
+
+    def stop(self):
+        """
+            Stop the Bluetooth Pin Pairing Agent Service
+        """
+
+        #Check to see if the PID file exists to see if the daemon is already running
+        proc_id = None
+        try:
+            with open(self._pid_file, 'r') as pid_f:
+                proc_id_str = pid_f.read().strip()
+                proc_id = int(proc_id_str)
+        except IOError:
+            proc_id = None
+
+        if not proc_id:
+            log_message("The 'Bluetooth Pin Pairing Agent Service' was not running.")
+            return # This is not an error in a restart so don't exit with a error code
+
+        # The process was running so we need to shut it down
+        try:
+            while True:
+                os.kill(proc_id, signal.SIGTERM)
+                time.sleep(0.1)
+        except OSError as os_err:
+            err_str = str(os_err)
+            if err_str.find("No such process") > 0:
+                if os.path.exists(self._pid_file):
+                    os.remove(self._pid_file)
+            else:
+                log_message(err_str)
+                sys.exit(1)
+
+        return
+
+    def _remove_pidfile(self):
+        if os.path.exists(self._pid_file):
+            os.remove(self._pid_file)
+        return
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser("Description bluetooth 'pin' based pairing agent.")
+    parser.add_argument("--action", default='start', choices=['start', 'stop', 'restart'], help="The action to perform with the service.")
+    parser.add_argument("--debug", default=True, action='store_true', help="Launches the service as a non-daemon process in debug mode.")
+    parser.add_argument("--single", default=True, action='store_true', help="Launches the service for a onetime pairing.")
+    try:
+        args = parser.parse_args()
+        action = args.action
+        DEBUG_MODE = args.debug
+        SINGLE_MODE = args.single
+
+        service = BluetoothService()
+        if action == 'restart':
+            service.restart()
+        elif action == 'start':
+            service.start()
+        elif action == 'stop':
+            service.stop()
+        else:
+            sys.stderr.write("Unknown command '%s'.\n" % action)
+            sys.stderr.write("usage: %s start|stop|restart|single\n" % sys.argv[0])
+            exit(2)
+
+        exit(0)
+    except SystemExit:
+        raise
+    except:
+        err_trace = traceback.format_exc()
+        log_message(err_trace)
+        exit(1)
