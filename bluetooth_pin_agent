@@ -89,12 +89,12 @@ AGENT_PIN_CODE = "123456"
 AGENT_DIR = os.path.abspath(os.path.dirname(__file__))
 
 LOG_DIR = "/var/log"
-if USER is not 'root':
+if USER != 'root':
     LOG_DIR = os.path.join(os.path.expanduser("~"), "logs")
     if not os.path.exists(LOG_DIR):
         os.makedirs(LOG_DIR)
 
-AGENT_SERVICE_LOGFILE = os.path.join(LOG_DIR, "simple_bluetooth_agent_d.log")
+AGENT_SERVICE_LOGFILE = os.path.join(LOG_DIR, "bluetooth_pin_agent.log")
 
 AGENT_PID_FILE = "/var/run/bluetooth_pin_agent.pid"
 
@@ -435,7 +435,7 @@ class BluetoothService(object):
         sys.stderr.flush()
 
         # Close all 1024 possible open FDs
-        for fd in xrange(maxfd):
+        for fd in range(maxfd):
             try:
                 os.close(fd)
             except OSError as os_err:
