@@ -10,7 +10,7 @@ The 'bluetooth_serial_service' service implements the 'org.bluez.Profile1' inter
 
 # Testing
 
-Platform           Linux                Bluetooth/BlueZ Ver            Paired With   
--------------------------------------------------------------------------------------
-AMD64 Desktop      Ubuntu 18.04         5.48-0ubuntu3.1                 Android
-NanoPiNeoAir       Ubuntu 16.04         5.37-0ubuntu5.1                 Android
+| Platform        | Linux          | Bluetooth/BlueZ Ver  | Paired With      | 
+|:----------------|:---------------|:---------------------|:-----------------|
+| AMD64 Desktop   | Ubuntu 18.04   | 5.48-0ubuntu3.1      | Android          |
+| NanoPiNeoAir    | Ubuntu 16.04   | 5.37-0ubuntu5.1      | Android          |
